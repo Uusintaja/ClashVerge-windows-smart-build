@@ -1,0 +1,32 @@
+diff --git a/src-tauri/src/utils/dirs.rs b/src-tauri/src/utils/dirs.rs
+index 236b3f1..0000000 100644
+--- a/src-tauri/src/utils/dirs.rs
++++ b/src-tauri/src/utils/dirs.rs
+@@ -24,11 +24,25 @@ pub static CLASH_CONFIG: &str = "config.yaml";
+ pub static VERGE_CONFIG: &str = "verge.yaml";
+ pub static PROFILE_YAML: &str = "profiles.yaml";
+ /// Marks that the one-shot raise of too-short auto-update intervals has already run.
+ pub static UPDATE_INTERVAL_MIGRATED: &str = ".update-interval-migrated";
+ 
++/// Portable override: when the executable sits next to a `Data` directory
++/// (created by the portable launcher), keep all app data there instead of
++/// the roaming profile. On Windows `dirs::data_dir()` resolves through the
++/// Known Folder API and ignores process environment overrides, so an
++/// env-only wrapper cannot redirect it; this early return is the only hook.
++fn portable_data_root() -> Option<PathBuf> {
++    let exe = std::env::current_exe().ok()?;
++    let root = exe.parent()?.join("Data").join(APP_ID);
++    root.is_dir().then_some(root)
++}
++
+ /// Uses the same platform data resolver as Tauri, including before its handle exists.
+ pub fn app_home_dir() -> Result<PathBuf> {
++    if let Some(root) = portable_data_root() {
++        return Ok(root);
++    }
+     ::dirs::data_dir()
+         .map(|root| root.join(APP_ID))
+         .ok_or_else(|| anyhow::anyhow!("Failed to get the app home directory"))
+ }
+ 
+ pub fn preinit_app_data_dir() -> Result<PathBuf> {
