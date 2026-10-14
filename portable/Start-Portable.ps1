@@ -73,12 +73,14 @@ if (-not $Exe) {
   exit 1
 }
 
-# 2. Create portable data folders
+# 2. Create portable data folders (Data/ mirrors a Windows profile:
+#    Data/Roaming/<APP_ID> is the app home the patched build reads)
 $Data = Join-Path $Base $DataDir
 $Roaming = Join-Path $Data "Roaming"
+$AppHome = Join-Path $Roaming $AppId
 $Local = Join-Path $Data "Local"
 $WebView = Join-Path $Data "EBWebView"
-foreach ($d in @($Roaming, $Local, $WebView)) {
+foreach ($d in @($AppHome, $Local, $WebView)) {
   if (-not (Test-Path -LiteralPath $d)) {
     New-Item -ItemType Directory -Path $d | Out-Null
   }
