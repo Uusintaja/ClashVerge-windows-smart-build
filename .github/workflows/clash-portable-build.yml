@@ -277,6 +277,14 @@ jobs:
           pnpm exec tauri build --no-bundle --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'tauri build failed' }
 
+      - name: List prebuild outputs
+        shell: pwsh
+        run: |
+          foreach ($d in @('upstream/src-tauri/resources', 'upstream/src-tauri/sidecar', 'fork/src-tauri')) {
+            if (Test-Path -LiteralPath $d) { Get-ChildItem -LiteralPath $d -Force | Format-Table Name, Length }
+            else { Write-Host "::warning::missing dir: $d" }
+          }
+
       - name: Stage portable package
         id: stage
         shell: pwsh
@@ -298,7 +306,13 @@ jobs:
           New-Item -ItemType Directory -Path (Join-Path $stage 'Data') | Out-Null
           Copy-Item -LiteralPath $exe -Destination $stage
           foreach ($c in $cores) { Copy-Item -LiteralPath $c.FullName -Destination $stage }
-          if (Test-Path -LiteralPath $res) { Copy-Item -LiteralPath (Join-Path $res '*') -Destination (Join-Path $stage 'resources') -Recurse }
+          $resItems = @()
+          if (Test-Path -LiteralPath $res) { $resItems = @(Get-ChildItem -LiteralPath $res -Force) }
+          if ($resItems.Count -eq 0) {
+            Write-Host '::warning::resources dir is missing or empty, skipping GeoIP/service seed files (app starts without them; core fetches Geo data on demand)'
+          } else {
+            Copy-Item -LiteralPath (Join-Path $res '*') -Destination (Join-Path $stage 'resources') -Recurse
+          }
           Copy-Item -LiteralPath 'fork/portable/*' -Destination $stage
           "short_sha=$sha" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "staged from upstream $sha"
