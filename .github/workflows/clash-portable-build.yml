@@ -1,0 +1,481 @@
+# Clash Verge Portable Build
+# Windows "auto-track upstream + apply portable patches + publish zip" workflow.
+# Modes: schedule (daily auto-track of upstream stable releases, smart skip)
+#        / workflow_dispatch (manual: release | custom).
+# Skeleton reused from a vaultwarden smart-build pipeline:
+#   check (cheap ubuntu) -> build (windows, only when needed) -> notify (on failure).
+# TODO(security): pin setup-node / pnpm / dtolnay actions to commit SHAs
+#   (checkout/cache/artifact/gh-release/rust-cache below are already pinned).
+
+name: Clash Verge Portable Build
+
+on:
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Build mode"
+        required: true
+        default: release
+        type: choice
+        options: [release, custom]
+      ref:
+        description: "Custom ref (tag/branch/commit) - used when mode=custom"
+        required: false
+        default: ""
+      dry_run:
+        description: "Check only (no build)"
+        required: false
+        default: false
+        type: boolean
+
+# Schedule and manual release share one group -> serialized (same version,
+# concurrent builds only waste Windows minutes and race the cleanup);
+# custom gets an independent group.
+concurrency:
+  group: cvp-${{ github.event.inputs.mode || 'release' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: clash-verge-rev/clash-verge-rev
+  RELEASE_PREFIX: cv-portable-
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  # Decision layer: cheap ubuntu fetches upstream, validates inputs, decides.
+  # The Windows runner only starts when compilation is actually needed.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.version_check.outputs.should_build }}
+      target_tag: ${{ steps.target_version.outputs.target_tag }}
+      mode: ${{ steps.resolve.outputs.mode }}
+      upstream_version: ${{ steps.target_version.outputs.upstream_version }}
+      latest_tag: ${{ steps.get_latest.outputs.latest_tag }}
+      target_sha: ${{ steps.deref_sha.outputs.target_sha }}
+    steps:
+      - name: Resolve inputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INP_MODE: ${{ github.event.inputs.mode }}
+          INP_REF: ${{ github.event.inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            mode="release"
+            custom=""
+          else
+            mode="${INP_MODE:-release}"
+            case "$mode" in release|custom) ;; *) mode="release" ;; esac
+            custom="${INP_REF:-}"
+          fi
+          {
+            echo "mode=$mode"
+            echo "custom=$custom"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream tag
+        id: get_latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          r=$(curl -fsSL --retry 3 --retry-delay 3 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "User-Agent: cvp-smart" \
+                "https://api.github.com/repos/$UPSTREAM/releases/latest")
+          tag=$(printf '%s' "$r" | jq -r '.tag_name // empty')
+          [ -n "$tag" ] || { echo "::error::upstream latest release has no tag_name"; exit 1; }
+          echo "latest_tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve target version
+        id: target_version
+        env:
+          MODE: ${{ steps.resolve.outputs.mode }}
+          CUSTOM: ${{ steps.resolve.outputs.custom }}
+          LATEST_TAG: ${{ steps.get_latest.outputs.latest_tag }}
+        run: |
+          set -euo pipefail
+          target=""
+          case "$MODE" in
+            release)
+              [ -n "$LATEST_TAG" ] || { echo "::error::no upstream release for release mode"; exit 1; }
+              target="$LATEST_TAG"
+              echo "upstream_version=${LATEST_TAG#v}" >> "$GITHUB_OUTPUT"
+              ;;
+            custom)
+              t="$CUSTOM"
+              [ -n "$t" ] || { echo "::error::custom ref required"; exit 1; }
+              printf '%s' "$t" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$' \
+                || { echo "::error::custom ref has invalid characters"; exit 1; }
+              printf '%s' "$t" | grep -Eq '\.\.|//' \
+                && { echo "::error::custom ref looks like path traversal"; exit 1; } || true
+              printf '%s' "$t" | grep -Eq '(^[./-]|[./-]$)' \
+                && { echo "::error::custom ref has bad leading/trailing char"; exit 1; } || true
+              target="$t"
+              echo "upstream_version=custom" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+          echo "target_tag=$target" >> "$GITHUB_OUTPUT"
+
+      # [schedule only] Dereference the tag -> short commit sha, for precise
+      # dedup (does not rely on the time-limited actions.cache).
+      - name: Resolve target commit sha
+        id: deref_sha
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target_version.outputs.target_tag }}
+        run: |
+          set -euo pipefail
+          ref=$(curl -fsSL --retry 3 --retry-delay 3 \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "User-Agent: cvp-smart" \
+                  "https://api.github.com/repos/$UPSTREAM/git/ref/tags/$(printf '%s' "$TAG" | sed 's/[&/\]/\\&/g')")
+          otype=$(printf '%s' "$ref" | jq -r '.object.type')
+          osha=$(printf '%s' "$ref"   | jq -r '.object.sha')
+          if [ "$otype" = "tag" ]; then
+            to=$(curl -fsSL --retry 3 --retry-delay 3 \
+                   -H "Authorization: Bearer $GH_TOKEN" \
+                   -H "User-Agent: cvp-smart" \
+                   "https://api.github.com/repos/$UPSTREAM/git/tags/$osha")
+            commit=$(printf '%s' "$to" | jq -r '.object.sha')
+          else
+            commit="$osha"
+          fi
+          [ -n "$commit" ] || { echo "::error::cannot resolve commit sha for $TAG"; exit 1; }
+          echo "target_sha=${commit:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: version_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          VER: ${{ steps.target_version.outputs.upstream_version }}
+          SHA: ${{ steps.deref_sha.outputs.target_sha }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          should=true; reason="manual"
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # Check our own releases for an existing build of this version@commit.
+            found=false
+            for p in 1 2 3 4 5; do
+              j=$(curl -fsSL --retry 3 --retry-delay 3 \
+                    -H "Authorization: Bearer $GH_TOKEN" -H "User-Agent: cvp-smart" \
+                    "https://api.github.com/repos/$REPO/releases?per_page=100&page=$p" || echo '[]')
+              if printf '%s' "$j" | jq -r '.[].tag_name' \
+                   | grep -Eq "^${RELEASE_PREFIX}v?${VER}.*-${SHA}(-|$)"; then
+                found=true; break
+              fi
+              n=$(printf '%s' "$j" | jq 'length')
+              [ "$n" -lt 100 ] && break
+            done
+            if [ "$found" = true ]; then should=false; reason="already built ($VER @ $SHA)"; else should=true; reason="new ($VER @ $SHA)"; fi
+          fi
+          if [ "${DRY_RUN:-false}" = true ]; then should=false; reason="$reason [dry-run]"; fi
+          echo "::notice::decision: should_build=$should reason=$reason"
+          echo "should_build=$should" >> "$GITHUB_OUTPUT"
+
+  # Execution layer: patch upstream source, compile, package, publish, cleanup.
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      MODE: ${{ needs.check.outputs.mode }}
+      UPSTREAM_TAG: ${{ needs.check.outputs.target_tag }}
+      UPSTREAM_VERSION: ${{ needs.check.outputs.upstream_version }}
+    steps:
+      - name: Checkout fork (patches + launchers)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          persist-credentials: false
+
+      - name: Checkout upstream source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: clash-verge-rev/clash-verge-rev
+          ref: ${{ needs.check.outputs.target_tag }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Apply portable patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = Get-ChildItem -LiteralPath 'fork/patches' -Filter '*.patch' | Sort-Object Name
+          if (-not $files) { throw 'no patch files found in fork/patches' }
+          foreach ($f in $files) {
+            git -C upstream apply --check $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "patch does not apply (upstream drifted): $($f.Name)" }
+          }
+          foreach ($f in $files) {
+            git -C upstream apply --stat $f.FullName
+            git -C upstream apply $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "patch apply failed: $($f.Name)" }
+          }
+          Write-Host "patches applied: $($files.Count)"
+
+      - name: Install Rust 1.99.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99.0'
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: upstream -> target
+          shared-key: cvp-rust-win-v1
+          add-job-id-key: false
+          cache-bin: false
+          save-if: ${{ env.MODE == 'release' }}
+
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.21.0'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 12.11.2
+          run_install: false
+
+      - name: Pnpm install and prebuild
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          pnpm i
+          if ($LASTEXITCODE -ne 0) { throw 'pnpm i failed' }
+          pnpm run prebuild x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'pnpm prebuild failed' }
+
+      # --no-bundle: only the exe + sidecars, no NSIS installer.
+      # Signing secrets are not needed (no updater artifacts are produced).
+      - name: Tauri build (no bundle)
+        shell: pwsh
+        working-directory: upstream
+        env:
+          NODE_OPTIONS: '--max_old_space_size=4096'
+        run: |
+          pnpm exec tauri build --no-bundle --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'tauri build failed' }
+
+      - name: Stage portable package
+        id: stage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rel = 'upstream/target/x86_64-pc-windows-msvc/release'
+          $exe = Join-Path $rel 'clash-verge.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "main exe missing: $exe" }
+          $cores = @(Get-ChildItem -LiteralPath $rel -Filter 'verge-mihomo*.exe')
+          if ($cores.Count -eq 0) { throw 'mihomo sidecar core missing' }
+          $res = 'upstream/src-tauri/resources'
+          if (-not (Test-Path -LiteralPath $res)) { Write-Host '::warning::resources dir missing, GeoIP seed files will be skipped' }
+          $sha = (git -C upstream rev-parse --short=12 HEAD).Trim()
+          if (-not $sha) { throw 'cannot resolve upstream commit sha' }
+          $stage = 'portable-stage'
+          if (Test-Path -LiteralPath $stage) { Remove-Item -Recurse -Force -LiteralPath $stage }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'resources') | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'Data') | Out-Null
+          Copy-Item -LiteralPath $exe -Destination $stage
+          foreach ($c in $cores) { Copy-Item -LiteralPath $c.FullName -Destination $stage }
+          if (Test-Path -LiteralPath $res) { Copy-Item -LiteralPath (Join-Path $res '*') -Destination (Join-Path $stage 'resources') -Recurse }
+          Copy-Item -LiteralPath 'fork/portable/*' -Destination $stage
+          "short_sha=$sha" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "staged from upstream $sha"
+
+      # File-level smoke (no GUI launch yet - see follow-up discussion):
+      # valid PE + sane sizes + every required entry present in the zip.
+      - name: Smoke test package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'portable-stage/clash-verge.exe'
+          $size = (Get-Item -LiteralPath $exe).Length
+          if ($size -lt 5MB) { throw "binary suspiciously small: $size bytes" }
+          $fs = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $exe).Path)
+          try { $mz = @($fs.ReadByte(), $fs.ReadByte()) } finally { $fs.Close() }
+          if ($mz[0] -ne 0x4D -or $mz[1] -ne 0x5A) { throw 'invalid PE: MZ header missing' }
+          foreach ($need in @('clash-verge.exe', 'Start-Portable.ps1', 'Run-As-Admin.bat')) {
+            $hits = @(Get-ChildItem -LiteralPath 'portable-stage' -Filter $need -Recurse)
+            if ($hits.Count -eq 0) { throw "package missing required entry: $need" }
+          }
+          $bat = Get-ChildItem -LiteralPath 'portable-stage' -Filter '*.bat'
+          if (-not $bat) { throw 'package missing launcher bat' }
+          Write-Host "Smoke OK: valid PE ($([math]::Round($size / 1MB, 1)) MB), all entries present"
+
+      - name: Package with 7z
+        shell: pwsh
+        run: |
+          7z a -tzip -mx=9 clash-verge-portable.zip ./portable-stage/*
+          if ($LASTEXITCODE -ne 0) { throw "7z packaging failed with exit code $LASTEXITCODE" }
+          $mb = [math]::Round((Get-Item clash-verge-portable.zip).Length / 1MB, 2)
+          "ZIP_SIZE_MB=$mb" | Out-File $env:GITHUB_ENV -Append
+          $hash = (Get-FileHash clash-verge-portable.zip -Algorithm SHA256).Hash.ToLower()
+          "ZIP_SHA256=$hash" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        # TODO(security): pin to commit SHA once verified (see file header).
+        uses: actions/upload-artifact@v4
+        with:
+          name: clash-verge-portable-${{ needs.check.outputs.upstream_version }}-${{ steps.stage.outputs.short_sha }}
+          path: clash-verge-portable.zip
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Compute release tag
+        id: set_release_tag
+        shell: bash
+        env:
+          VER: ${{ needs.check.outputs.upstream_version }}
+          SHA: ${{ steps.stage.outputs.short_sha }}
+          MODE: ${{ env.MODE }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            release)
+              echo "release_tag=${RELEASE_PREFIX}v${VER}-${SHA}-r${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "make_latest=true"  >> "$GITHUB_OUTPUT"
+              echo "prerelease=false"  >> "$GITHUB_OUTPUT"
+              ;;
+            custom)
+              echo "release_tag=${RELEASE_PREFIX}v${VER}-${SHA}-${MODE}-r${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "make_latest=false" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true"   >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::unknown mode $MODE"; exit 1 ;;
+          esac
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.set_release_tag.outputs.release_tag }}
+          name: Clash Verge Portable ${{ needs.check.outputs.upstream_version }}
+          body: |
+            ### Clash Verge Portable ${{ needs.check.outputs.upstream_version }} (Windows x64)
+
+            - **Upstream**: `clash-verge-rev/clash-verge-rev @ ${{ needs.check.outputs.target_tag }}` (`${{ steps.stage.outputs.short_sha }}`)
+            - **Mode**: `${{ env.MODE }}`
+            - **Size**: `${{ env.ZIP_SIZE_MB }} MB`
+            - **SHA256**: `${{ env.ZIP_SHA256 }}`
+            - **Build run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Usage: extract the archive (keep the `Data/` folder next to the exe) and run the launcher bat. Do not run the exe directly.
+          files: clash-verge-portable.zip
+          make_latest: ${{ steps.set_release_tag.outputs.make_latest }}
+          prerelease: ${{ steps.set_release_tag.outputs.prerelease }}
+          fail_on_unmatched_files: true
+
+      # Cleanup in two steps; stable releases are never deleted:
+      #  (1) dedup by "version|sha"; (2) cap only prereleases to KEEP.
+      - name: Cleanup old releases
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CURRENT_TAG: ${{ steps.set_release_tag.outputs.release_tag }}
+        run: |
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; "User-Agent" = "cvp-smart"; Accept = "application/vnd.github+json" }
+          $CUR = $env:CURRENT_TAG
+          $KEEP = 8
+          $all = @()
+          for ($p = 1; $p -le 20; $p++) {
+            $r = Invoke-RestMethod "https://api.github.com/repos/$env:REPO/releases?per_page=100&page=$p" -Headers $h -ErrorAction SilentlyContinue
+            if (-not $r) { break }
+            $all += ($r | Where-Object { $_.tag_name -like "$RELEASE_PREFIX*" })
+            if ($r.Count -lt 100) { break }
+            Start-Sleep -Milliseconds 200
+          }
+          Write-Host "total cv-portable-* releases: $($all.Count)"
+          if ($all.Count -eq 0) { exit 0 }
+          function KeyOf($t) {
+            if ($t -match '^cv-portable-v?(.+?)-([0-9a-f]{12})(?:-(release|custom))?(?:-r\d+)?$') {
+              return "$($matches[1])|$($matches[2])"
+            }
+            return $null
+          }
+          function DeleteRel($x) {
+            try {
+              Invoke-RestMethod -Method Delete "https://api.github.com/repos/$env:REPO/releases/$($x.id)" -Headers $h | Out-Null
+            } catch { Write-Host "  release delete failed ($($x.tag_name)): $($_.Exception.Message)"; return $false }
+            try { Invoke-RestMethod -Method Delete "https://api.github.com/repos/$env:REPO/git/refs/tags/$($x.tag_name)" -Headers $h | Out-Null } catch {}
+            return $true
+          }
+          $deleted = 0
+          $groups = $all | Where-Object { KeyOf $_.tag_name } | Group-Object { KeyOf $_.tag_name }
+          foreach ($g in $groups) {
+            if ($g.Group.Count -le 1) { continue }
+            $sorted = $g.Group | Sort-Object published_at -Descending
+            for ($i = 1; $i -lt $sorted.Count; $i++) {
+              if ($sorted[$i].tag_name -eq $CUR) { continue }
+              if (DeleteRel $sorted[$i]) { Write-Host "  dedup deleted: $($sorted[$i].tag_name)"; $deleted++ }
+            }
+          }
+          $pre = $all | Where-Object { $_.prerelease } | Sort-Object published_at -Descending
+          if ($pre.Count -gt $KEEP) {
+            for ($i = $KEEP; $i -lt $pre.Count; $i++) {
+              if ($pre[$i].tag_name -eq $CUR) { continue }
+              if (DeleteRel $pre[$i]) { Write-Host "  cap deleted: $($pre[$i].tag_name)"; $deleted++ }
+            }
+          }
+          Write-Host "========== cleanup done: deleted $deleted releases =========="
+
+  # Failure notification: fixed title (no spam), never fails the workflow.
+  notify:
+    needs: [check, build]
+    if: always() && (needs.check.result == 'failure' || needs.build.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Open or update failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+          TITLE="Clash portable build FAILED"
+          URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+          NUM=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/issues?state=open" \
+                | jq -r --arg t "$TITLE" '.[] | select(.title==$t) | .number' | head -n1)
+          BODY="Build failed at $URL (run #$RUN_ID)."
+          PAYLOAD=$(jq -nc --arg b "$BODY" '{body:$b}')
+          if [ -n "$NUM" ]; then
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$NUM/comments" -d "$PAYLOAD" >/dev/null
+            echo "commented on issue #$NUM"
+          else
+            CREATE=$(jq -nc --arg t "$TITLE" --arg b "$BODY" '{title:$t,body:$b}')
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues" -d "$CREATE" >/dev/null
+            echo "created new failure issue"
+          fi
+          exit 0
